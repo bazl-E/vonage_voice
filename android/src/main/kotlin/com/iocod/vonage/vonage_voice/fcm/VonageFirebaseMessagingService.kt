@@ -124,22 +124,41 @@ class VonageFirebaseMessagingService : FirebaseMessagingService() {
             return
         }
 
-        // ── Active Vonage call guard ──────────────────────────────────────
-        // Vonage is single-call only (no hold/swap/conference). If there is
-        // already an active or pending Vonage call, ignore the 2nd invite
-        // entirely — it will appear as "missed" on the Vonage side.
-        if (TVConnectionService.hasActiveCall() || TVConnectionService.pendingInvites.isNotEmpty()) {
-            android.util.Log.w("VonageFCM", "[FCM-1] Active Vonage call exists — skipping 2nd VoIP invite")
-            return
-        }
-
-        // Vonage pushes always contain a "nexmo" key.
+        // Vonage pushes always contain a "nexmo" key — check this first so
+        // non-Vonage FCM messages (Twilio, app notifications, etc.) are
+        // discarded immediately without touching any Vonage-specific state.
         val nexmoRaw = data["nexmo"]
         if (nexmoRaw.isNullOrEmpty()) {
             android.util.Log.d("VonageFCM", "[FCM-1] No 'nexmo' key — not a Vonage push, ignored")
             return
         }
         android.util.Log.i("VonageFCM", "[FCM-2] ✓ Vonage push detected")
+
+        // ── Active Vonage call guard ──────────────────────────────────────
+        // Vonage is single-call only (no hold/swap/conference). If there is
+        // already an active or pending Vonage call, ignore a 2nd *invite*
+        // entirely — it will appear as "missed" on the Vonage side.
+        //
+        // CRITICAL: Cancel/hangup pushes MUST bypass this guard.
+        // When A cancels before B answers, Vonage sends a cancel FCM push.
+        // At that moment pendingInvites.isNotEmpty() is true (B is ringing),
+        // so the old blind guard would discard the cancel push — leaving B
+        // ringing indefinitely when the WebSocket is also down.
+        // Invite pushes carry "type":"member:invited"; cancel/hangup pushes
+        // carry a different type and must reach processPushCallInvite() so
+        // the SDK fires setCallInviteCancelListener and stops the ringing.
+        val isInvitePush = try {
+            JSONObject(nexmoRaw).optString("type", "").contains("invited", ignoreCase = true)
+        } catch (e: Exception) { false }  // assume NOT an invite on parse failure — cancel/hangup
+        // pushes must always reach processPushCallInvite(); blocking them on bad JSON is worse
+        // than letting a potentially malformed invite through (duplicate guard catches it later).
+
+        TVConnectionService.clearStaleInvitesIfAny(applicationContext)
+
+        if (isInvitePush && (TVConnectionService.hasActiveCall() || TVConnectionService.pendingInvites.isNotEmpty())) {
+            android.util.Log.w("VonageFCM", "[FCM-1] Active Vonage call exists — skipping 2nd VoIP invite")
+            return
+        }
 
         // Record timestamp so the Dart fallback path (processVonagePush)
         // can detect that a native FCM service is already processing this push
@@ -313,14 +332,22 @@ class VonageFirebaseMessagingService : FirebaseMessagingService() {
             // Since Vonage doesn't integrate with Android Telecom for call lifecycle,
             // we must register the SDK hangup listener at the FCM level.
             client.setOnCallHangupListener { callId, quality, reason ->
-                android.util.Log.d("VonageFCM",
-                    "[FCM-HANGUP] Remote hangup detected (killed-app path): callId=$callId, reason=$reason")
+                // ★ PATH = FCM PUSH (WebSocket was down — app was killed or in background
+                //   with no active plugin session; Vonage delivered hangup via push)
+                val hasConn   = TVConnectionService.activeConnections.containsKey(callId)
+                val hasInvite = TVConnectionService.pendingInvites.containsKey(callId)
+                android.util.Log.i("VonageFCM",
+                    "[HANGUP][FCM] ▶ hangup via FCM push path (WebSocket down / app killed)" +
+                    " callId=$callId reason=$reason" +
+                    " hasConnection=$hasConn hasPendingInvite=$hasInvite")
 
                 // Remove the connection from the active map
                 val connection = TVConnectionService.activeConnections[callId]
                 val pendingInvite = TVConnectionService.pendingInvites[callId]
 
                 if (connection != null) {
+                    android.util.Log.i("VonageFCM",
+                        "[HANGUP][FCM] ✓ active connection found — disconnecting + broadcasting CALL_ENDED")
                     connection.disconnect()
                     TVConnectionService.activeConnections.remove(callId)
 
@@ -330,9 +357,33 @@ class VonageFirebaseMessagingService : FirebaseMessagingService() {
                     }
                     LocalBroadcastManager.getInstance(applicationContext).sendBroadcast(broadcastIntent)
                 } else if (pendingInvite != null) {
-                    // "Answered elsewhere" — SDK fires hangup instead of invite-cancel
-                    pendingInvite.cancel()
-                    TVConnectionService.pendingInvites.remove(callId)
+                    // "Answered elsewhere" — SDK fires hangup instead of invite-cancel.
+                    // Delegate to TVConnectionService via ACTION_CANCEL_CALL_INVITE so the
+                    // full teardown runs: ringtone, wake lock, notification, pending-call
+                    // prefs, and the exception-guarded cancel() with fallback broadcast.
+                    android.util.Log.i("VonageFCM",
+                        "[HANGUP][FCM] ✓ pending invite found (answered elsewhere) — delegating to service for full teardown")
+                    val cancelIntent = Intent(applicationContext, TVConnectionService::class.java).apply {
+                        action = Constants.ACTION_CANCEL_CALL_INVITE
+                        putExtra(Constants.EXTRA_CALL_ID, callId)
+                    }
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                        applicationContext.startForegroundService(cancelIntent)
+                    } else {
+                        applicationContext.startService(cancelIntent)
+                    }
+                } else {
+                    // Fallback: connection was already removed by a concurrent cleanup path.
+                    // Still broadcast CALL_ENDED so any alive Flutter engine / activity can
+                    // react and dismiss the call screen — prevents a stuck UI after remote
+                    // hangup when the FCM path and plugin path race.
+                    android.util.Log.w("VonageFCM",
+                        "[HANGUP][FCM] ⚠ no connection/invite for callId=$callId" +
+                        " — emitting fallback CALL_ENDED (race/double-cleanup)")
+                    val fallbackBroadcast = Intent(Constants.BROADCAST_CALL_ENDED).apply {
+                        putExtra(Constants.EXTRA_CALL_ID, callId)
+                    }
+                    LocalBroadcastManager.getInstance(applicationContext).sendBroadcast(fallbackBroadcast)
                 }
 
                 // Clear stale pending data so unlock doesn't navigate to a dead call
@@ -431,6 +482,36 @@ class VonageFirebaseMessagingService : FirebaseMessagingService() {
             } catch (e: Exception) {
                 android.util.Log.e("VonageFCM", "[FCM-5] processPushCallInvite threw: ${e.message}", e)
             }
+
+            // ── Background WebSocket revival (doze-mode guard) ────────────────
+            // When the app is backgrounded, Android doze mode silently kills the
+            // TCP connection that backs the Vonage WebSocket while the VoiceClient
+            // object stays alive in memory (clientWasNull=false, isSessionReady=true).
+            // processPushCallInvite() above succeeds using the stale session, but
+            // the server-side cancel (caller hangs up) can NEVER arrive over the
+            // dead socket.  Calling createSession() here re-establishes a live
+            // WebSocket while the phone is still ringing.  If the caller hangs up
+            // before the new session is ready, the 60 s fallback timer in
+            // TVConnectionService covers the gap.  Fire-and-forget — we never
+            // block the FCM callback on this result.
+            val storedJwt = VonageClientHolder.getStoredJwt(applicationContext)
+            if (storedJwt != null) {
+                android.util.Log.i("VonageFCM", "[FCM-5] Kicking background WebSocket revival (doze-mode guard)...")
+                // client is VoiceClient? (var), so !! is safe here — we are inside the
+                // clientWasNull=false branch, meaning client was non-null and session was
+                // ready when this FCM arrived.
+                client!!.createSession(storedJwt) { error, sessionId ->
+                    if (error != null) {
+                        android.util.Log.w("VonageFCM", "[FCM-5] WebSocket revival failed: ${error.message} — 60s fallback active")
+                    } else {
+                        android.util.Log.i("VonageFCM", "[FCM-5] ✓ WebSocket revived — sessionId=$sessionId. Cancel will now arrive normally")
+                        VonageClientHolder.isSessionReady = true
+                    }
+                }
+            } else {
+                android.util.Log.w("VonageFCM", "[FCM-5] No stored JWT — cannot revive WebSocket. 60s fallback active")
+            }
+
             releaseProcessingWakeLock(wakeLock)
         }
     }

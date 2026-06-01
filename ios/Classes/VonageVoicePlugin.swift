@@ -636,6 +636,12 @@ extension VonageVoicePlugin {
             return
         }
 
+        if pendingPushUUID != nil {
+            sendPhoneCallEvents(description: "LOG|tokens: Session restore in progress via PushKit push — skipping duplicate createSession")
+            result(true)
+            return
+        }
+
         sendPhoneCallEvents(description: "LOG|tokens: Creating session with Vonage")
 
         voiceClient.createSession(jwt) { [weak self] error, sessionId in
@@ -668,6 +674,24 @@ extension VonageVoicePlugin {
         isSessionReady = false
         UserDefaults.standard.removeObject(forKey: Keys.cachedDeviceId)
         clearStoredJwt()
+
+        // Release the CXProvider when no real Vonage call is active.
+        // Without this, any .incomingCall VoIP push arriving after logout would hit
+        // the "using existing provider" path in reportDummyCallAndEnd (because
+        // callKitProvider is still non-nil), firing providerDidBegin and making the
+        // brief "Unknown" dummy call more prominent. Clearing it here ensures the
+        // temp-provider path is always used for post-logout pushes.
+        if activeCalls.isEmpty && callInvites.isEmpty, callKitProvider != nil {
+            isIntentionalProviderReset = true
+            let providerToInvalidate = callKitProvider
+            callKitProvider = nil
+            callKitCallController = nil
+            providerToInvalidate?.setDelegate(nil, queue: nil)
+            DispatchQueue.main.async {
+                providerToInvalidate?.invalidate()
+                VGVoiceClient.isUsingCallKit = false
+            }
+        }
 
         // Deletes the Vonage session and resolves the Dart future.
         // Called after unregisterDeviceTokens completes (or is skipped when no deviceId).
@@ -2360,17 +2384,35 @@ extension VonageVoicePlugin: PKPushRegistryDelegate {
             return
         }
 
-        // Lazily create the CXProvider — a real incoming call requires CallKit
-        // to report the incoming call (Apple kills the app otherwise).
-        setupCallKit()
-
         // ── KILLED STATE: No session → restore from stored JWT ───────
-        if accessToken == nil, let storedJwt = getStoredJwt() {
+        // Guard: pendingPushUUID == nil prevents re-entering handleKilledStatePush
+        // for a second push that arrives while the first push's createSession is still
+        // in-flight. Without it, the second push would overwrite pendingPushUUID and
+        // pendingPushCompletion, breaking the first push's coordination (Apple kills
+        // the app if completion() is never called) and firing a duplicate createSession.
+        // Note: accessToken is set synchronously inside handleKilledStatePush before
+        // createSession, so the LOGGED OUT guard below naturally catches any subsequent
+        // push once the first handleKilledStatePush has started.
+        if !isSessionReady, pendingPushUUID == nil, let storedJwt = getStoredJwt() {
+            // Real call: create the CXProvider before handing off to handleKilledStatePush.
+            setupCallKit()
             handleKilledStatePush(payload: payload, storedJwt: storedJwt, completion: completion)
             return
         }
 
         // ── LOGGED OUT: No session, no JWT ───────────────────────────
+        // IMPORTANT: Do NOT call setupCallKit() here.
+        // setupCallKit() creates a persistent CXProvider and sets VGVoiceClient.isUsingCallKit=true.
+        // In the logged-out state we cannot process this call — calling setupCallKit() would:
+        //   1. Fire providerDidBegin (activating the provider for no real call)
+        //   2. Make reportDummyCallAndEnd use the "existing provider" path instead of
+        //      a local temp provider, causing the "Unknown" ringing call to appear
+        //      prominently via the persistent system-registered provider.
+        //   3. Leave VGVoiceClient.isUsingCallKit=true after the dummy call ends
+        //      (reportDummyCallAndEnd does not reset it), which can interfere with
+        //      subsequent Twilio calls.
+        // Using the temp-provider path in reportDummyCallAndEnd is correct here:
+        // it satisfies Apple's reportNewIncomingCall mandate without any persistent state.
         if accessToken == nil {
             sendPhoneCallEvents(description: "LOG|No session and no stored JWT — cannot process push")
             reportDummyCallAndEnd(completion: completion)
@@ -2378,8 +2420,10 @@ extension VonageVoicePlugin: PKPushRegistryDelegate {
         }
 
         // ── FOREGROUND / BACKGROUND: Session exists ──────────────────
+        // Real call: create the CXProvider before processing the invite.
         // processCallInvitePushData triggers didReceiveInviteForCall synchronously,
         // which calls reportNewIncomingCall before we reach completion().
+        setupCallKit()
         voiceClient.processCallInvitePushData(payload.dictionaryPayload)
         completion()
     }
@@ -2446,6 +2490,15 @@ extension VonageVoicePlugin: PKPushRegistryDelegate {
             }
             self.isSessionReady = true
             self.sendPhoneCallEvents(description: "LOG|Session restored successfully, processing push")
+            // Re-register the VoIP push token now that the session is live.
+            // handleTokens() may have been called while createSession was still
+            // in flight (pendingPushUUID != nil + isSessionReady == false), so
+            // it skipped token registration. Do it here to ensure Vonage always
+            // has a current device registration — mirrors the isSessionReady path
+            // in handleTokens().
+            if let token = self.deviceToken {
+                self.registerPushToken(token)
+            }
             self.voiceClient.processCallInvitePushData(payload.dictionaryPayload)
             // completion() is called from didReceiveInviteForCall via pendingPushCompletion.
         }
@@ -2464,11 +2517,18 @@ extension VonageVoicePlugin: PKPushRegistryDelegate {
         callUpdate.remoteHandle = CXHandle(type: .generic, value: "Unknown")
         callUpdate.localizedCallerName = "Unknown"
 
+        // Use .answeredElsewhere instead of .failed as the end reason.
+        // .failed records the call in the system recents as a "failed" entry, which
+        // iOS may present as a missed-call notification. .answeredElsewhere tells iOS
+        // the call was handled on another device/context — it does not generate a
+        // missed-call notification and does not appear prominently in recents.
+        let endReason = CXCallEndedReason.answeredElsewhere
+
         if let existingProvider = callKitProvider {
             // Real Vonage call is active — use the persistent provider.
             sendPhoneCallEvents(description: "LOG|reportDummyCallAndEnd: using existing provider")
             existingProvider.reportNewIncomingCall(with: uuid, update: callUpdate) { [weak self] _ in
-                existingProvider.reportCall(with: uuid, endedAt: Date(), reason: .failed)
+                existingProvider.reportCall(with: uuid, endedAt: Date(), reason: endReason)
                 if let self = self, self.activeCalls.isEmpty && self.callInvites.isEmpty {
                     self.sendPhoneCallEvents(description: "LOG|reportDummyCallAndEnd: releasing CXProvider (no active calls)")
                     self.isIntentionalProviderReset = true
@@ -2492,7 +2552,7 @@ extension VonageVoicePlugin: PKPushRegistryDelegate {
             // No setDelegate — we only report, we don't need to handle CXActions.
             let tempProvider = CXProvider(configuration: config)
             tempProvider.reportNewIncomingCall(with: uuid, update: callUpdate) { _ in
-                tempProvider.reportCall(with: uuid, endedAt: Date(), reason: .failed)
+                tempProvider.reportCall(with: uuid, endedAt: Date(), reason: endReason)
                 tempProvider.invalidate()
                 completion()
             }
@@ -2681,7 +2741,16 @@ extension VonageVoicePlugin: VGVoiceClientDelegate {
             // Call" would set isCallEnded=true in the BLoC and dismiss the first
             // call's active screen. Mirrors the activeCalls.isEmpty guard used in
             // all other "Missed Call" emission sites.
+            //
+            // Also suppress during session teardown (unregister/user-switch): the SDK
+            // fires cancel callbacks as cleanup when deleteSession() runs. At that point
+            // isSessionReady is already false, and any "Missed Call" emission would
+            // create a phantom "Unknown" missed-call record in the app's call log.
             if activeCalls.isEmpty {
+                guard isSessionReady else {
+                    sendPhoneCallEvents(description: "LOG|Cancel received with no matching invite during teardown (isSessionReady=false) — suppressed to prevent phantom missed call")
+                    return
+                }
                 sendPhoneCallEvents(description: "LOG|Cancel received with no matching invite — emitting Missed Call")
                 sendPhoneCallEvents(description: "Missed Call")
             } else {
