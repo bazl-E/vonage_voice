@@ -211,14 +211,27 @@ class VonageVoicePlugin :
         broadcastReceiver?.unregister(binding.applicationContext)
         broadcastReceiver = null
 
-        // Clear VoiceClient from holder and release session
-        voiceClient?.deleteSession { error ->
-            if (error != null) logEvent("deleteSession error: ${error.message}")
+        // Clear VoiceClient from holder and release session — UNLESS a call is being
+        // hung up because the app was swiped away (onDetachedFromEngine fires on the
+        // same swipe as TVConnectionService.onTaskRemoved). Deleting the session /
+        // nulling the client here would close the WebSocket out from under the
+        // in-flight hangup and leave the call connected server-side. When a call is in
+        // play, leave the client + session intact; the service tears them down after
+        // the hangup flushes, and process death reclaims whatever is left.
+        val callInPlay = VonageClientHolder.isTerminating
+                || TVConnectionService.activeConnections.isNotEmpty()
+                || TVConnectionService.pendingInvites.isNotEmpty()
+        if (callInPlay) {
+            logEvent("onDetachedFromEngine: call in play — keeping VoiceClient/session alive so the hangup can flush")
+        } else {
+            voiceClient?.deleteSession { error ->
+                if (error != null) logEvent("deleteSession error: ${error.message}")
+            }
+            VonageClientHolder.voiceClient = null
+            voiceClient = null
         }
-        VonageClientHolder.voiceClient = null
         VonageClientHolder.isCallAnsweredNatively = false
         VonageClientHolder.isAnsweringInProgress = false
-        voiceClient = null
 
         context = null
     }

@@ -493,6 +493,74 @@ class TVConnectionService : ConnectionService() {
     }
 
     /**
+     * The user swiped the app away from recents. End every active call / pending
+     * invite by routing each through the canonical per-call hangup path
+     * ([handleHangup]) — exactly what an in-app "hang up" does. handleHangup stops
+     * the ringtone/vibration, cancels the per-invite timeout, releases the incoming
+     * wake lock, clears the persisted pending/answered/FCM call data, dismisses the
+     * incoming-call UI (BROADCAST_CALL_INVITE_CANCELLED), hangs up/rejects on the
+     * Vonage client, and — once both maps are empty — cancels the notification and
+     * stops the foreground service. Reusing it keeps this path in lockstep with the
+     * proven teardown instead of re-implementing (and drifting from) every step.
+     *
+     * NOTE: a hard force-stop / OEM battery kill destroys the process with no
+     * callback at all; ending the leg in that case can only be guaranteed
+     * server-side (media timeout), which is out of scope here.
+     */
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        // Snapshot all live call ids BEFORE looping — handleHangup mutates both maps.
+        val ids = (activeConnections.keys + pendingInvites.keys).toList()
+        android.util.Log.i("TVConnectionService",
+            "[onTaskRemoved] app removed from recents — ending ${ids.size} call(s)/invite(s): $ids")
+        if (ids.isNotEmpty()) {
+            // Tell VonageVoicePlugin.onDetachedFromEngine (which also fires on this
+            // swipe) NOT to deleteSession()/null the VoiceClient — the hangup below
+            // needs the live client + open WebSocket. Reset after the flush window.
+            VonageClientHolder.isTerminating = true
+            // End each call/invite via the canonical handleHangup path, but DEFER the
+            // foreground-service stop. client.hangup()/reject() is an ASYNC WebSocket
+            // send; on aggressive OEMs the process is reaped the instant the foreground
+            // service stops — before the frame reaches Vonage — leaving the call up
+            // server-side. Keeping the foreground service (hence process importance)
+            // alive for a short flush window lets the frame send, then we tear down.
+            for (cid in ids) {
+                handleHangup(
+                    Intent(Constants.ACTION_HANGUP).apply { putExtra(Constants.EXTRA_CALL_ID, cid) },
+                    deferServiceStop = true
+                )
+            }
+            android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                // Guard against a new incoming call arriving during the flush window —
+                // don't tear the service down if one did (it now owns the service).
+                if (activeConnections.isEmpty() && pendingInvites.isEmpty()) {
+                    VonageClientHolder.isTerminating = false
+                    try {
+                        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                        nm.cancel(Constants.NOTIFICATION_ID)
+                        stopForeground(true)
+                    } catch (e: Exception) {
+                        android.util.Log.w("TVConnectionService", "[onTaskRemoved] deferred teardown failed: ${e.message}")
+                    }
+                    stopSelf()
+                } else {
+                    VonageClientHolder.isTerminating = false
+                    android.util.Log.i("TVConnectionService",
+                        "[onTaskRemoved] new call arrived during flush window — keeping service alive")
+                }
+            }, 2500L)
+        } else {
+            // No calls — tear down so we don't leak the service.
+            try {
+                val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                nm.cancel(Constants.NOTIFICATION_ID)
+                stopForeground(true)
+            } catch (_: Exception) {}
+            stopSelf()
+        }
+        super.onTaskRemoved(rootIntent)
+    }
+
+    /**
      * Ensures the service is promoted to foreground.
      * Called early in onStartCommand to prevent the 5-second ANR
      * when the service is started via startForegroundService().
@@ -1574,7 +1642,7 @@ class TVConnectionService : ConnectionService() {
      * Intent extras required:
      *   EXTRA_CALL_ID — callId to hang up
      */
-    private fun handleHangup(intent: Intent) {
+    private fun handleHangup(intent: Intent, deferServiceStop: Boolean = false) {
         val callId = intent.getStringExtra(Constants.EXTRA_CALL_ID) ?: return
 
         // Cancel the per-invite timeout — the call is being declined/ended normally
@@ -1651,11 +1719,19 @@ class TVConnectionService : ConnectionService() {
         // Always cancel the notification and stop the service when no calls remain
         if (activeConnections.isEmpty() && pendingInvites.isEmpty()) {
             releaseAudioFocus()
-            val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE)
-                    as NotificationManager
-            notificationManager.cancel(Constants.NOTIFICATION_ID)
-            stopForeground(true)
-            stopSelf()
+            if (deferServiceStop) {
+                // Caller (onTaskRemoved) keeps the foreground service alive briefly so
+                // the async hangup/reject WebSocket frame can flush to Vonage before
+                // the process is reaped, then tears the service down itself.
+                android.util.Log.d("TVConnectionService",
+                    "handleHangup: deferring foreground/stopSelf teardown to caller (flush window)")
+            } else {
+                val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE)
+                        as NotificationManager
+                notificationManager.cancel(Constants.NOTIFICATION_ID)
+                stopForeground(true)
+                stopSelf()
+            }
         }
     }
 
@@ -2593,6 +2669,17 @@ object VonageClientHolder {
      */
     @Volatile
     var isAnsweringInProgress: Boolean = false
+
+    /**
+     * True while the app is being terminated (swiped from recents) and an active
+     * call is being hung up. Set by [TVConnectionService.onTaskRemoved] before the
+     * hangup; checked by VonageVoicePlugin.onDetachedFromEngine (which fires on the
+     * same swipe) so it does NOT deleteSession()/null the VoiceClient out from under
+     * the in-flight hangup — that would close the WebSocket and leave the call up
+     * server-side. Reset after the hangup flush window.
+     */
+    @Volatile
+    var isTerminating: Boolean = false
 
     /**
      * Set of callIds already processed by processPushCallInvite().
