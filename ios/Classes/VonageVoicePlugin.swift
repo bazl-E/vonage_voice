@@ -249,6 +249,33 @@ public class VonageVoicePlugin: NSObject, FlutterPlugin, FlutterStreamHandler {
         NotificationCenter.default.removeObserver(self)
     }
 
+    /// Best-effort: end any active Vonage call(s) on app termination so the remote
+    /// party's call ends instead of lingering until a media timeout. Forwarded via
+    /// registrar.addApplicationDelegate(instance).
+    ///
+    /// LIMITATION: iOS does NOT reliably deliver applicationWillTerminate when the
+    /// user swipe-kills a *suspended* app; a true hard-kill can skip it, leaving the
+    /// leg to end via Vonage's server-side media timeout.
+    @objc public func applicationWillTerminate(_ application: UIApplication) {
+        guard voiceClient != nil else { return }
+        if activeCalls.isEmpty && callInvites.isEmpty { return }
+        NSLog("VonageVoice: applicationWillTerminate — hanging up \(activeCalls.count) call(s), rejecting \(callInvites.count) invite(s)")
+        for (_, callId) in activeCalls {
+            voiceClient.hangup(callId) { error in
+                if let error = error { NSLog("VonageVoice: applicationWillTerminate hangup failed: \(error.localizedDescription)") }
+            }
+        }
+        for (_, invite) in callInvites {
+            // Skip the killed-state placeholder (empty callId, real id not yet
+            // delivered) — rejecting "" no-ops/errors, mirroring the guarded
+            // decline path in provider(perform: CXEndCallAction).
+            if invite.callId.isEmpty { continue }
+            voiceClient.reject(invite.callId) { error in
+                if let error = error { NSLog("VonageVoice: applicationWillTerminate reject failed: \(error.localizedDescription)") }
+            }
+        }
+    }
+
     // ═════════════════════════════════════════════════════════════════
     // MARK: - Lazy CallKit Setup
     // ═════════════════════════════════════════════════════════════════
