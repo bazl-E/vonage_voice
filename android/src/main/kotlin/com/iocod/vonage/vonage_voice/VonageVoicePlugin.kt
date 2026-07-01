@@ -734,15 +734,44 @@ class VonageVoicePlugin :
             // Fall through to createSession() below
         }
 
-        // Create session with the JWT from Flutter — never hardcoded
-        voiceClient!!.createSession(jwt) { error, sessionId ->
+        // Create session with the JWT from Flutter — never hardcoded.
+        // createSession can transiently time out on Android ("Session failed due to
+        // a timeout expiration") when the network/SDK handshake is slow. The
+        // incoming-call (FCM) path already retries for this exact reason; mirror it
+        // here so a single transient timeout doesn't fail the whole outbound call.
+        createSessionWithRetry(voiceClient!!, jwt, ctx, call, result, retriesLeft = 2)
+    }
+
+    /**
+     * Calls [VoiceClient.createSession] with retry-on-failure. The Vonage Android
+     * session handshake can transiently time out; the FCM push path
+     * ([VonageFirebaseMessagingService.restoreSessionWithRetry]) retries for the
+     * same reason. Retries up to [retriesLeft] times with a 2s backoff before
+     * surfacing SESSION_ERROR to Flutter. [result] is resolved exactly once.
+     */
+    private fun createSessionWithRetry(
+        client: VoiceClient,
+        jwt: String,
+        ctx: Context,
+        call: MethodCall,
+        result: Result,
+        retriesLeft: Int
+    ) {
+        client.createSession(jwt) { error, sessionId ->
             if (error != null) {
-                android.util.Log.e("VonagePlugin", "createSession failed: ${error.message}")
-                result.error(
-                    FlutterErrorCodes.SESSION_ERROR,
-                    "createSession failed: ${error.message}",
-                    null
-                )
+                android.util.Log.e("VonagePlugin", "createSession failed (retriesLeft=$retriesLeft): ${error.message}")
+                if (retriesLeft > 0) {
+                    android.util.Log.i("VonagePlugin", "Retrying createSession in 2000ms...")
+                    Handler(Looper.getMainLooper()).postDelayed({
+                        createSessionWithRetry(client, jwt, ctx, call, result, retriesLeft - 1)
+                    }, 2000L)
+                } else {
+                    result.error(
+                        FlutterErrorCodes.SESSION_ERROR,
+                        "createSession failed: ${error.message}",
+                        null
+                    )
+                }
                 return@createSession
             }
             android.util.Log.i("VonagePlugin", "Session created: $sessionId")
