@@ -877,7 +877,13 @@ extension VonageVoicePlugin {
         userExplicitlyChangedAudioRoute = false
 
         let from = arguments["from"] as? String ?? ""
-        let callerName = arguments["CallerName"] as? String ?? ""
+        // Dart (vonage_call_event_service.dart) sends the key lowercase as
+        // "callerName" — this MUST match exactly, method channel argument
+        // lookup is case-sensitive. A prior mismatch here ("CallerName")
+        // meant this always read nil, so outgoingCallerName was permanently
+        // empty and CallKit fell back to the raw number for every outgoing
+        // Vonage call (both the in-call UI and the native Recents entry).
+        let callerName = arguments["callerName"] as? String ?? ""
 
         // Debug: log each argument key, value, and Swift type
         for (key, value) in arguments {
