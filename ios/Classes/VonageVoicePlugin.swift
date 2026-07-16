@@ -877,7 +877,7 @@ extension VonageVoicePlugin {
         userExplicitlyChangedAudioRoute = false
 
         let from = arguments["from"] as? String ?? ""
-        let callerName = arguments["CallerName"] as? String ?? ""
+        let callerName = arguments["callerName"] as? String ?? ""
 
         // Debug: log each argument key, value, and Swift type
         for (key, value) in arguments {
